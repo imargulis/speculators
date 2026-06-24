@@ -69,8 +69,8 @@ def _resolve_scheduler_steps(
 
     Explicit ``scheduler_warmup_steps`` wins; otherwise ``scheduler_warmup_ratio``
     (a fraction of total steps, validated to ``[0, 1]``) is used; otherwise the
-    legacy default of 1% of total steps. ``scheduler_total_steps`` defaults to
-    ``num_epochs * train_loader_len``.
+    default of 1% of the resolved total steps. ``scheduler_total_steps`` defaults
+    to ``num_epochs * train_loader_len``.
     """
     default_total_steps = config.num_epochs * train_loader_len
     scheduler_total_steps = (
@@ -94,7 +94,7 @@ def _resolve_scheduler_steps(
             scheduler_total_steps * config.scheduler_warmup_ratio
         )
     else:
-        scheduler_warmup_steps = default_total_steps // 100
+        scheduler_warmup_steps = scheduler_total_steps // 100
 
     return scheduler_warmup_steps, scheduler_total_steps
 

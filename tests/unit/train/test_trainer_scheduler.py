@@ -25,6 +25,18 @@ def test_scheduler_steps_default_to_one_percent_of_training_steps():
     assert warmup_steps == 1
 
 
+def test_scheduler_total_steps_only_defaults_warmup_to_one_percent_of_total():
+    # default_total_steps is num_epochs * loader_len = 100, but the explicit
+    # scheduler_total_steps override must drive the 1% warmup fallback (10, not 1).
+    warmup_steps, total_steps = _resolve_scheduler_steps(
+        make_config(scheduler_total_steps=1000),
+        20,
+    )
+
+    assert total_steps == 1000
+    assert warmup_steps == 10
+
+
 def test_scheduler_warmup_ratio_uses_scheduler_total_steps():
     warmup_steps, total_steps = _resolve_scheduler_steps(
         make_config(scheduler_total_steps=200, scheduler_warmup_ratio=0.1),
