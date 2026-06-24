@@ -41,8 +41,8 @@ class TrainerConfig(NamedTuple):
     is_distributed: bool = False
     local_rank: int = 0
     rank: int = 0
-    train_call_kwargs: dict = {}
-    val_call_kwargs: dict = {}
+    train_call_kwargs: dict | None = None
+    val_call_kwargs: dict | None = None
     optimizer: Literal["adamw", "muon"] = "adamw"
     weight_decay: float = 0.01
     muon_lr: float = 0.02
@@ -52,12 +52,59 @@ class TrainerConfig(NamedTuple):
     muon_adjust_lr_fn: str = "match_rms_adamw"
     scheduler_type: Literal["linear", "cosine", "none"] = "linear"
     scheduler_warmup_steps: int | None = None
+    scheduler_warmup_ratio: float | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: float = 1
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
+
+
+def _resolve_scheduler_steps(
+    config: TrainerConfig,
+    train_loader_len: int,
+) -> tuple[int, int]:
+    """Resolve ``(warmup_steps, total_steps)`` for the LR scheduler.
+
+    Explicit ``scheduler_warmup_steps`` wins; otherwise ``scheduler_warmup_ratio``
+    (a fraction of total steps, validated to ``[0, 1]``) is used; otherwise the
+    legacy default of 1% of total steps. ``scheduler_total_steps`` defaults to
+    ``num_epochs * train_loader_len``.
+    """
+    default_total_steps = config.num_epochs * train_loader_len
+    scheduler_total_steps = (
+        config.scheduler_total_steps
+        if config.scheduler_total_steps is not None
+        else default_total_steps
+    )
+
+    if config.scheduler_warmup_steps is not None:
+        scheduler_warmup_steps = config.scheduler_warmup_steps
+        if config.scheduler_warmup_ratio is not None:
+            warnings.warn(
+                "Both scheduler_warmup_steps and scheduler_warmup_ratio are set; "
+                "using scheduler_warmup_steps.",
+                stacklevel=2,
+            )
+    elif config.scheduler_warmup_ratio is not None:
+        if not 0 <= config.scheduler_warmup_ratio <= 1:
+            raise ValueError("scheduler_warmup_ratio must be between 0 and 1.")
+        scheduler_warmup_steps = int(
+            scheduler_total_steps * config.scheduler_warmup_ratio
+        )
+    else:
+        scheduler_warmup_steps = default_total_steps // 100
+
+    return scheduler_warmup_steps, scheduler_total_steps
+
+
+def _prepare_metrics_for_logging(
+    metrics: dict[str, torch.Tensor],
+    world_size: int = 1,
+) -> dict[str, float]:
+    metric_values = {k: v.item() for k, v in metrics.items()}
+    return normalize_counted_metrics(metric_values, world_size)
 
 
 class Trainer:
@@ -70,6 +117,10 @@ class Trainer:
     ):
         self.model = model
         self.config = config
+        # Resolve the call-kwarg dicts per instance (defaults are None) so the shared
+        # NamedTuple defaults can't be mutated across Trainer instances.
+        self.train_call_kwargs: dict = dict(config.train_call_kwargs or {})
+        self.val_call_kwargs: dict = dict(config.val_call_kwargs or {})
         self.local_rank = config.local_rank
         self.rank = config.rank
         self.train_loader = train_loader
@@ -170,13 +221,9 @@ class Trainer:
             self.schedulers: list[torch.optim.lr_scheduler.LRScheduler] = []
             return
 
-        # Compute defaults if None
-        scheduler_warmup_steps = (
-            self.config.scheduler_warmup_steps
-            or (self.config.num_epochs * len(self.train_loader)) // 100
-        )
-        scheduler_total_steps = self.config.scheduler_total_steps or (
-            self.config.num_epochs * len(self.train_loader)
+        scheduler_warmup_steps, scheduler_total_steps = _resolve_scheduler_steps(
+            self.config,
+            len(self.train_loader),
         )
 
         def make_scheduler(opt: torch.optim.Optimizer):
@@ -236,7 +283,7 @@ class Trainer:
             }
 
             _draft_tokens, loss, metrics = self.model(
-                **gpu_batch, **self.config.train_call_kwargs
+                **gpu_batch, **self.train_call_kwargs
             )
 
             self._optimizers_zero_grad()
@@ -253,24 +300,27 @@ class Trainer:
                 if self.is_distributed:
                     for v in metrics.values():
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
+                    should_log = self.rank == 0
+                else:
+                    should_log = True
 
-                metrics = {k: v.item() for k, v in metrics.items()}
-                world_size = dist.get_world_size() if self.is_distributed else 1
-                metrics = normalize_counted_metrics(metrics, world_size)
-                lr_info = (
-                    current_lrs
-                    if len(current_lrs) > 1
-                    else next(iter(current_lrs.values()))
-                )
-                metric_logger.info(
-                    {
-                        "train": metrics,
-                        "epoch": epoch,
-                        "lr": lr_info,
-                        "global_step": self.global_step,
-                    },
-                    extra={"step": self.global_step},
-                )
+                if should_log:
+                    world_size = dist.get_world_size() if self.is_distributed else 1
+                    metrics = _prepare_metrics_for_logging(metrics, world_size)
+                    lr_info = (
+                        current_lrs
+                        if len(current_lrs) > 1
+                        else next(iter(current_lrs.values()))
+                    )
+                    metric_logger.info(
+                        {
+                            "train": metrics,
+                            "epoch": epoch,
+                            "lr": lr_info,
+                            "global_step": self.global_step,
+                        },
+                        extra={"step": self.global_step},
+                    )
             self.global_step += 1
 
             if (
@@ -304,7 +354,7 @@ class Trainer:
             }
 
             _draft_tokens, _loss, metrics = self.model(
-                **gpu_batch, **self.config.val_call_kwargs
+                **gpu_batch, **self.val_call_kwargs
             )
 
             if self.is_distributed:

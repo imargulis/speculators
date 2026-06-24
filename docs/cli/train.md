@@ -170,9 +170,11 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 ### Learning Rate Scheduler Arguments
 
-- **`--scheduler-type`** (str, default: `"linear"`) Type of learning rate scheduler. Options: `linear`, `cosine`, `constant`
+- **`--scheduler-type`** (str, default: `"linear"`) Type of learning rate scheduler. Options: `linear`, `cosine`, `none`
 
 - **`--scheduler-warmup-steps`** (int, default: `None`) Number of warmup steps for the scheduler.
+
+- **`--scheduler-warmup-ratio`** (float, default: `None`) Fraction of total scheduler steps used for warmup. Ignored when `--scheduler-warmup-steps` is set.
 
 - **`--scheduler-total-steps`** (int, default: `None`) Total number of training steps for the scheduler.
 
