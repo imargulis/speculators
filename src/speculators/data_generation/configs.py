@@ -83,6 +83,12 @@ def resolve_normalize_fn(config: DatasetConfig) -> NormalizeFn | None:
     """
     if config.normalize_fn is not None:
         return config.normalize_fn
+    if (config.prompt_column is None) != (config.answer_column is None):
+        raise ValueError(
+            "prompt_column and answer_column must be set together to build a "
+            f"prompt/response conversation; got prompt_column="
+            f"{config.prompt_column!r}, answer_column={config.answer_column!r}."
+        )
     if config.prompt_column is not None and config.answer_column is not None:
         return _make_prompt_response_normalizer(
             config.prompt_column, config.answer_column

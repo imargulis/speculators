@@ -137,6 +137,21 @@ def test_resolve_normalize_fn_explicit_fn_is_escape_hatch():
 
 
 @pytest.mark.sanity
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"prompt_column": "question"},
+        {"answer_column": "answer"},
+    ],
+)
+def test_resolve_normalize_fn_partial_prompt_answer_raises(overrides):
+    # A partial prompt/answer hint is a misconfiguration; fail loud rather than
+    # silently skipping normalization.
+    with pytest.raises(ValueError, match="must be set together"):
+        resolve_normalize_fn(_cfg(**overrides))
+
+
+@pytest.mark.sanity
 def test_gsm8k_preset_uses_prompt_answer_hints():
     cfg = DATASET_CONFIGS["gsm8k"]
     assert cfg.normalize_fn is None
