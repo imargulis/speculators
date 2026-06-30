@@ -21,7 +21,7 @@ from transformers import (
 )
 from transformers import __version__ as TRANSFORMERS_VERSION  # noqa: N812
 
-from speculators.data_generation.configs import DATASET_CONFIGS
+from speculators.data_generation.configs import DATASET_CONFIGS, resolve_normalize_fn
 from speculators.data_generation.logging_utils import PipelineLogger
 from speculators.data_generation.torch_utils import set_default_torch_num_threads
 from speculators.train.vocab_mapping import save_token_frequency_distribution
@@ -74,6 +74,53 @@ def _visualize_sample(preprocessed: HFDataset, processor: ProcessorLike, idx: in
     log.info(highlighted)
 
 
+# Declarative map of source role names to the canonical role. Easier to extend
+# than an if/elif chain. `observation` is a tool result (function output), so it
+# maps to the tool role rather than user.
+ROLE_ALIASES = {
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "system": "system",
+    "tool": "tool",
+    "observation": "tool",
+}
+
+
+def _normalize_turn(turn: dict) -> dict | None:
+    """Normalize a single conversation turn to canonical role/content keys.
+
+    Returns ``None`` (signalling the caller to skip the turn) when the role is
+    not recognized.
+    """
+    raw_role = turn.get("from", turn.get("role", ""))
+    role = ROLE_ALIASES.get(raw_role)
+    if role is None:
+        log.warning(f"Unknown role '{raw_role}', skipping turn")
+        return None
+
+    normalized_turn: dict = {
+        "role": role,
+        "content": turn.get("value") or turn.get("content") or "",
+    }
+
+    # Preserve tool_calls and tool_call_id if present
+    if turn.get("tool_calls"):
+        normalized_turn["tool_calls"] = turn["tool_calls"]
+    if turn.get("tool_call_id"):
+        normalized_turn["tool_call_id"] = turn["tool_call_id"]
+
+    # Preserve thinking / reasoning_content independently so neither clobbers the
+    # other when both are present with different values.
+    if turn.get("thinking"):
+        normalized_turn["thinking"] = turn["thinking"]
+    if turn.get("reasoning_content"):
+        normalized_turn["reasoning_content"] = turn["reasoning_content"]
+
+    return normalized_turn
+
+
 def _normalize_conversation(
     conv: list[dict],
     turn_dropout: bool = False,
@@ -87,45 +134,22 @@ def _normalize_conversation(
     Returns:
         Normalized conversation with optional turn dropout applied
     """
+    if not conv:
+        return []
+
     # Randomly pick how many consecutive turns to keep from the start
     num_turns_to_keep = random.randint(1, len(conv)) if turn_dropout else len(conv)
 
     normalized = []
     for i, turn in enumerate(conv):
-        role = turn.get("from", turn.get("role", ""))
-        content = turn.get("value") or turn.get("content") or ""
-
-        # Map various role names to standard user/assistant
-        if role in ("human", "user"):
-            role = "user"
-        elif role in ("gpt", "assistant"):
-            role = "assistant"
-        elif role == "system":
-            role = "system"
-        elif role == "tool":
-            role = "tool"
-        else:
-            log.warning(f"Unknown role '{role}', skipping turn")
+        normalized_turn = _normalize_turn(turn)
+        if normalized_turn is None:
             continue
-
-        # Build normalized turn with role and content
-        normalized_turn = {"role": role, "content": content}
-
-        # Preserve tool_calls and tool_call_id if present
-        if turn.get("tool_calls"):
-            normalized_turn["tool_calls"] = turn["tool_calls"]
-        if turn.get("tool_call_id"):
-            normalized_turn["tool_call_id"] = turn["tool_call_id"]
-
-        thinking = turn.get("thinking") or turn.get("reasoning_content")
-        if thinking:
-            normalized_turn["thinking"] = thinking
-            normalized_turn["reasoning_content"] = thinking
 
         normalized.append(normalized_turn)
 
         # Stop if we've reached the truncation point
-        if i + 1 >= num_turns_to_keep and role == "assistant":
+        if i + 1 >= num_turns_to_keep and normalized_turn["role"] == "assistant":
             # Only break after an assistant turn
             break
 
@@ -651,6 +675,23 @@ def build_eagle3_dataset(
     return dataset
 
 
+def _rename_messages_to_conversations(dataset: HFDataset) -> HFDataset:
+    """Canonicalize the conversation column to ``conversations``.
+
+    Renames a ``messages`` column to ``conversations`` automatically during
+    ingestion, so datasets using the OpenAI-style ``messages`` key need no
+    per-dataset normalizer. If both columns exist, the redundant ``messages``
+    column is dropped.
+    """
+    columns = dataset.column_names
+    if "messages" not in columns:
+        return dataset
+    if "conversations" in columns:
+        return dataset.remove_columns("messages")
+    log.info("Renaming 'messages' column to 'conversations'")
+    return dataset.rename_column("messages", "conversations")
+
+
 def load_raw_dataset(
     train_data_path: str,
 ) -> tuple[HFDataset, Callable[[dict], dict] | None]:
@@ -670,7 +711,7 @@ def load_raw_dataset(
     if config.filter_fn is not None:
         raw_dataset = raw_dataset.filter(config.filter_fn)
 
-    return raw_dataset, config.normalize_fn
+    return raw_dataset, resolve_normalize_fn(config)
 
 
 def get_tokenizer(processor: ProcessorLike):
@@ -770,6 +811,11 @@ def load_and_preprocess_dataset(
                 num_proc=build_dataset_num_proc,
                 keep_in_memory=True,  # skip caching
             )
+
+        # Canonicalize 'messages' -> 'conversations' automatically for any source
+        # (local file or preset) that didn't already produce a 'conversations'
+        # column, so no per-dataset normalizer is needed for that common case.
+        raw_dataset = _rename_messages_to_conversations(raw_dataset)
 
         log.info(f"Loaded {len(raw_dataset)} samples")
 

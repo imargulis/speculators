@@ -7,34 +7,89 @@ from dataclasses import dataclass
 __all__ = [
     "DATASET_CONFIGS",
     "DatasetConfig",
+    "resolve_normalize_fn",
 ]
+
+
+NormalizeFn = Callable[[dict], dict]
 
 
 @dataclass(kw_only=True)
 class DatasetConfig:
-    """Configuration for loading a dataset"""
+    """Configuration for loading a dataset.
+
+    The conversation schema can be described declaratively so a normalizer is
+    generated from config instead of hand-written (see ``resolve_normalize_fn``):
+
+    - ``conversations_column``: name of the column already holding a list of
+      conversation turns; it is renamed to the canonical ``"conversations"``.
+    - ``prompt_column`` / ``answer_column``: build a two-turn (user, assistant)
+      conversation from a prompt/response pair.
+
+    ``normalize_fn`` remains an explicit escape hatch for schemas that can't be
+    expressed with the hints above (e.g. multi-modal datasets).
+    """
 
     name: str
     hf_path: str
     subset: str | None = None
     split: str
     filter_fn: Callable[[dict], bool] | None = None
-    normalize_fn: Callable[[dict], dict] | None = None
+    conversations_column: str = "conversations"
+    prompt_column: str | None = None
+    answer_column: str | None = None
+    normalize_fn: NormalizeFn | None = None
 
 
-def _normalize_ultrachat(example: dict) -> dict:
-    if "messages" in example:
-        return {"conversations": example["messages"]}
-    return example
+def _make_rename_normalizer(source_column: str) -> NormalizeFn:
+    """Build a normalizer that renames ``source_column`` to ``"conversations"``."""
+
+    def normalize(example: dict) -> dict:
+        if "conversations" in example or source_column not in example:
+            return example
+        return {"conversations": example[source_column]}
+
+    normalize.__name__ = f"normalize_rename_{source_column}"
+    return normalize
 
 
-def _normalize_gsm8k(example: dict) -> dict:
-    return {
-        "conversations": [
-            {"role": "user", "content": example["question"]},
-            {"role": "assistant", "content": example["answer"]},
-        ]
-    }
+def _make_prompt_response_normalizer(
+    prompt_column: str,
+    answer_column: str,
+) -> NormalizeFn:
+    """Build a normalizer that turns a prompt/answer pair into a conversation."""
+
+    def normalize(example: dict) -> dict:
+        if "conversations" in example:
+            return example
+        return {
+            "conversations": [
+                {"role": "user", "content": example[prompt_column]},
+                {"role": "assistant", "content": example[answer_column]},
+            ]
+        }
+
+    normalize.__name__ = f"normalize_{prompt_column}_{answer_column}"
+    return normalize
+
+
+def resolve_normalize_fn(config: DatasetConfig) -> NormalizeFn | None:
+    """Resolve the normalizer for a dataset config.
+
+    An explicit ``normalize_fn`` always wins; otherwise one is generated from the
+    declarative schema hints. Returns ``None`` when the dataset is already in the
+    canonical ``conversations`` schema (the ``messages``-column case is handled
+    generically during ingestion, so it needs no per-dataset normalizer).
+    """
+    if config.normalize_fn is not None:
+        return config.normalize_fn
+    if config.prompt_column is not None and config.answer_column is not None:
+        return _make_prompt_response_normalizer(
+            config.prompt_column, config.answer_column
+        )
+    if config.conversations_column != "conversations":
+        return _make_rename_normalizer(config.conversations_column)
+    return None
 
 
 def get_coco_dir():
@@ -101,14 +156,15 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
         name="ultrachat",
         hf_path="HuggingFaceH4/ultrachat_200k",
         split="train_sft",
-        normalize_fn=_normalize_ultrachat,
+        # 'messages' column is renamed to 'conversations' automatically.
     ),
     "gsm8k": DatasetConfig(
         name="gsm8k",
         hf_path="openai/gsm8k",
         subset="main",
         split="train",
-        normalize_fn=_normalize_gsm8k,
+        prompt_column="question",
+        answer_column="answer",
     ),
     # NOTE: You need to serve vLLM with `--allowed-local-media-path /path/to/coco`
     "sharegpt4v_coco": DatasetConfig(
