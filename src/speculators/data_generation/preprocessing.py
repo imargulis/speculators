@@ -4,6 +4,7 @@ import random
 import re
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from re import Pattern
 from typing import cast
@@ -12,6 +13,7 @@ import torch
 from datasets import Dataset as HFDataset
 from datasets import concatenate_datasets, load_dataset
 from packaging.version import Version
+from pyarrow.parquet import ParquetFile
 from transformers import (
     AutoProcessor,
     BatchEncoding,
@@ -651,17 +653,232 @@ def build_eagle3_dataset(
     return dataset
 
 
+# Internal column used to track which local file/split a row came from, so
+# concatenation warnings can name the source. Removed before the dataset is used.
+SOURCE_COLUMN = "__speculators_source"
+DATASET_FORMAT_BY_SUFFIX = {
+    ".json": "json",
+    ".jsonl": "json",
+    ".parquet": "parquet",
+}
+# Max distinct source names to list verbatim in a concat warning before eliding.
+_MAX_LISTED_CONCAT_SOURCES = 3
+
+
+@dataclass
+class LocalDatasetGroup:
+    """A set of local files sharing a loader format and provenance source."""
+
+    dataset_format: str
+    source: str
+    files: list[str]
+
+
+def _local_dataset_source(root: Path, file_path: Path) -> str:
+    """Derive a provenance label: top-level subdir name, else the file stem."""
+    if root.is_file():
+        return root.stem
+    relative_path = file_path.relative_to(root)
+    if len(relative_path.parts) > 1:
+        return relative_path.parts[0]
+    return file_path.stem
+
+
+def _local_dataset_candidates(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    return sorted(p for p in path.rglob("*") if p.is_file())
+
+
+def _dataset_format_for_file(path: Path) -> str | None:
+    return DATASET_FORMAT_BY_SUFFIX.get(path.suffix.lower())
+
+
+def _collect_local_dataset_groups(path: Path) -> list[LocalDatasetGroup]:
+    """Group supported local files by (loader format, provenance source)."""
+    files_by_group: dict[tuple[str, str], list[str]] = {}
+    for file_path in _local_dataset_candidates(path):
+        dataset_format = _dataset_format_for_file(file_path)
+        if dataset_format is None:
+            if path.is_file():
+                supported = ", ".join(sorted(DATASET_FORMAT_BY_SUFFIX))
+                raise ValueError(
+                    f"Unsupported local data file extension. Use: {supported}"
+                )
+            continue
+        source = _local_dataset_source(path, file_path)
+        files_by_group.setdefault((dataset_format, source), []).append(str(file_path))
+
+    return [
+        LocalDatasetGroup(dataset_format=fmt, source=source, files=files)
+        for (fmt, source), files in sorted(files_by_group.items())
+    ]
+
+
+def _add_source_column(dataset: HFDataset, source: str) -> HFDataset:
+    if SOURCE_COLUMN in dataset.column_names:
+        return dataset
+    return dataset.add_column(SOURCE_COLUMN, [source] * len(dataset))
+
+
+def _concat_source_label(
+    dataset: HFDataset,
+    index: int,
+    source_names: list[str] | None = None,
+) -> str:
+    if source_names is not None and index < len(source_names):
+        return source_names[index]
+    if SOURCE_COLUMN in dataset.column_names and len(dataset) > 0:
+        sources = sorted({str(s) for s in dataset[SOURCE_COLUMN]})
+        if len(sources) == 1:
+            return sources[0]
+        if len(sources) <= _MAX_LISTED_CONCAT_SOURCES:
+            return ", ".join(sources)
+        listed = ", ".join(sources[:_MAX_LISTED_CONCAT_SOURCES])
+        return f"{listed}, ..."
+    return f"dataset #{index}"
+
+
+def _warn_dropped_concat_columns(
+    datasets: list[HFDataset],
+    columns_to_keep: set[str],
+    source_names: list[str] | None = None,
+) -> None:
+    source_labels = [
+        _concat_source_label(dataset, index, source_names)
+        for index, dataset in enumerate(datasets)
+    ]
+    all_columns = sorted(
+        {column for dataset in datasets for column in dataset.column_names}
+    )
+    for column in all_columns:
+        if column in columns_to_keep:
+            continue
+        present = [
+            label
+            for label, dataset in zip(source_labels, datasets, strict=True)
+            if column in dataset.column_names
+        ]
+        missing = [
+            label
+            for label, dataset in zip(source_labels, datasets, strict=True)
+            if column not in dataset.column_names
+        ]
+        log.warning(
+            f"Dropping non-shared column '{column}' during dataset concatenation. "
+            f"Present in: {present}; missing from: {missing}."
+        )
+
+
+def _concat_with_common_columns(
+    datasets: list[HFDataset],
+    source_names: list[str] | None = None,
+) -> HFDataset:
+    """Concatenate datasets, keeping only the columns shared by all of them.
+
+    Files/splits with differing (or differently-nested) schemas can't be
+    concatenated directly, so non-shared columns are dropped (with a warning)
+    rather than raising a ``DatasetGenerationError``.
+    """
+    if not datasets:
+        raise ValueError("Cannot concatenate an empty dataset list")
+    if len(datasets) == 1:
+        return datasets[0]
+
+    common_columns = set.intersection(
+        *(set(dataset.column_names) for dataset in datasets)
+    )
+    # The internal provenance column is shared by construction; ignore it when
+    # deciding whether the datasets have any real data column in common, so
+    # disjoint schemas fail loudly instead of silently yielding an empty dataset.
+    if not common_columns - {SOURCE_COLUMN}:
+        raise ValueError("Cannot concatenate local datasets with no common columns")
+
+    columns_to_keep = sorted(common_columns)
+    _warn_dropped_concat_columns(datasets, set(columns_to_keep), source_names)
+    normalized = [
+        dataset.remove_columns(
+            [c for c in dataset.column_names if c not in columns_to_keep]
+        )
+        for dataset in datasets
+    ]
+    return concatenate_datasets(normalized)
+
+
+def _load_parquet_files(parquet_files: list[str]) -> HFDataset:
+    """Load parquet files, grouping by schema when a directory mixes schemas."""
+    schema_groups: dict[tuple[str, ...], list[str]] = {}
+    for file_path in parquet_files:
+        columns = tuple(sorted(ParquetFile(file_path).schema_arrow.names))
+        schema_groups.setdefault(columns, []).append(file_path)
+
+    if len(schema_groups) == 1:
+        return load_dataset("parquet", data_files=parquet_files, split="train")
+
+    log.warning(
+        f"Found {len(schema_groups)} different parquet schemas; loading groups "
+        "separately and concatenating on common columns."
+    )
+    return _concat_with_common_columns(
+        [
+            load_dataset("parquet", data_files=group_files, split="train")
+            for group_files in schema_groups.values()
+        ]
+    )
+
+
+def _load_dataset_files(dataset_format: str, files: list[str]) -> HFDataset:
+    if dataset_format == "parquet":
+        return _load_parquet_files(files)
+    return load_dataset(dataset_format, data_files=files, split="train")
+
+
+def _load_local_directory(path: Path) -> HFDataset:
+    """Load a local directory bundle of .json/.jsonl/.parquet files.
+
+    Files are grouped by (format, source) so heterogeneous splits load correctly,
+    each group is tagged with its provenance source, and the groups are
+    concatenated on their common columns. The internal provenance column is
+    removed before return.
+    """
+    groups = _collect_local_dataset_groups(path)
+    if not groups:
+        raise ValueError(
+            f"No supported data files (.json/.jsonl/.parquet) found in: {path}"
+        )
+
+    datasets = []
+    for group in groups:
+        dataset = _add_source_column(
+            _load_dataset_files(group.dataset_format, group.files), group.source
+        )
+        log.info(
+            f"Loaded {len(dataset)} rows ({group.dataset_format}) "
+            f"from source '{group.source}'"
+        )
+        datasets.append(dataset)
+
+    combined = _concat_with_common_columns(datasets)
+    if SOURCE_COLUMN in combined.column_names:
+        combined = combined.remove_columns(SOURCE_COLUMN)
+    return combined
+
+
 def load_raw_dataset(
     train_data_path: str,
 ) -> tuple[HFDataset, Callable[[dict], dict] | None]:
-    """Load raw dataset from local file or HuggingFace."""
+    """Load raw dataset from a local file, local directory bundle, or HuggingFace."""
     if train_data_path.endswith((".jsonl", ".json")):
         return load_dataset("json", data_files=train_data_path, split="train"), None
 
+    path = Path(train_data_path)
+    if path.is_dir():
+        return _load_local_directory(path), None
+
     if train_data_path not in DATASET_CONFIGS:
         raise ValueError(
-            f"Unsupported dataset: {train_data_path}. "
-            f"Supported: local .json/.jsonl files or {list(DATASET_CONFIGS.keys())}"
+            f"Unsupported dataset: {train_data_path}. Supported: local .json/.jsonl "
+            f"files, local directory bundles, or {list(DATASET_CONFIGS.keys())}"
         )
 
     config = DATASET_CONFIGS[train_data_path]
